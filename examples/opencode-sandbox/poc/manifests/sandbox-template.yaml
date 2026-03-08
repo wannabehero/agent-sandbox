@@ -1,0 +1,26 @@
+apiVersion: extensions.agents.x-k8s.io/v1alpha1
+kind: SandboxTemplate
+metadata:
+  name: opencode-template
+  namespace: opencode
+spec:
+  podTemplate:
+    spec:
+      containers:
+        - name: sandbox
+          image: poc-sandbox:latest
+          imagePullPolicy: Never   # loaded into kind via `kind load docker-image`
+          ports:
+            - containerPort: 4096
+          env:
+            - name: ANTHROPIC_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: llm-keys
+                  key: anthropic
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 4096
+            initialDelaySeconds: 3
+            periodSeconds: 3

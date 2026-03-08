@@ -1,0 +1,111 @@
+<!DOCTYPE html>
+<html>
+<head><title>opencode PoC</title></head>
+<body>
+  <div id="messages" style="font-family:monospace;white-space:pre-wrap;max-width:900px"></div>
+  <br>
+  <textarea id="input" rows="4" cols="80" placeholder="Type your message... (Enter to send, Shift+Enter for newline)"></textarea>
+  <br>
+  <button id="send">Send</button>
+  <button id="close" disabled>Close Session</button>
+  <span id="status" style="margin-left:1em;color:gray"></span>
+
+  <script>
+    let sessionId = null
+
+    function setStatus(s) {
+      document.getElementById('status').textContent = s
+    }
+
+    function appendLine(text) {
+      const el = document.createElement('div')
+      el.textContent = text
+      document.getElementById('messages').appendChild(el)
+      return el
+    }
+
+    async function ensureSession() {
+      if (sessionId) return
+      setStatus('Starting sandbox...')
+      document.getElementById('send').disabled = true
+      const r = await fetch('/session', { method: 'POST' })
+      if (!r.ok) {
+        const err = await r.json()
+        throw new Error(err.error || 'failed to create session')
+      }
+      const d = await r.json()
+      sessionId = d.id
+      document.getElementById('close').disabled = false
+      setStatus('Ready  [' + sessionId + ']')
+    }
+
+    async function send() {
+      const input = document.getElementById('input')
+      const text = input.value.trim()
+      if (!text) return
+
+      document.getElementById('send').disabled = true
+      input.value = ''
+
+      try {
+        await ensureSession()
+      } catch (e) {
+        appendLine('ERROR: ' + e.message)
+        document.getElementById('send').disabled = false
+        return
+      }
+
+      appendLine('You: ' + text)
+      const asstEl = appendLine('Assistant: ')
+
+      const r = await fetch('/session/' + sessionId + '/message', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text }),
+      })
+
+      if (!r.ok) {
+        asstEl.textContent += '[error ' + r.status + ']'
+        document.getElementById('send').disabled = false
+        return
+      }
+
+      const reader = r.body.getReader()
+      const decoder = new TextDecoder()
+      let buf = ''
+
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+        buf += decoder.decode(value, { stream: true })
+        const lines = buf.split('\n')
+        buf = lines.pop()
+        for (const line of lines) {
+          if (!line.startsWith('data: ')) continue
+          const data = line.slice(6)
+          if (data === '[DONE]') continue
+          try { asstEl.textContent += JSON.parse(data).delta } catch {}
+        }
+      }
+
+      appendLine('')
+      document.getElementById('send').disabled = false
+    }
+
+    document.getElementById('send').addEventListener('click', send)
+    document.getElementById('input').addEventListener('keydown', e => {
+      if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send() }
+    })
+
+    document.getElementById('close').addEventListener('click', async () => {
+      if (!sessionId) return
+      setStatus('Closing...')
+      await fetch('/session/' + sessionId, { method: 'DELETE' })
+      sessionId = null
+      document.getElementById('close').disabled = true
+      appendLine('--- session closed ---')
+      setStatus('')
+    })
+  </script>
+</body>
+</html>
