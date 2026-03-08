@@ -1,12 +1,11 @@
-FROM python:3.12-slim
+FROM node:22-slim
 
-WORKDIR /app
+RUN npm install -g opencode-ai
 
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-
-COPY server.py .
+# Working directory opencode will use for coding tasks
+WORKDIR /workspace
 
 EXPOSE 4096
 
-CMD ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "4096"]
+# opencode serve starts the HTTP API server (no TUI needed)
+CMD ["opencode", "serve", "--hostname", "0.0.0.0", "--port", "4096"]

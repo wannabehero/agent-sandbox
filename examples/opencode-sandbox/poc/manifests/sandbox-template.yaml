@@ -18,9 +18,14 @@ spec:
                 secretKeyRef:
                   name: llm-keys
                   key: anthropic
+            # Tell opencode how to find the API key via its config system
+            - name: OPENCODE_CONFIG_CONTENT
+              value: |
+                {"provider":{"anthropic":{"options":{"apiKey":"{env:ANTHROPIC_API_KEY}"}}}}
           readinessProbe:
             httpGet:
-              path: /healthz
+              path: /doc      # opencode's OpenAPI spec endpoint — always returns 200
               port: 4096
-            initialDelaySeconds: 3
-            periodSeconds: 3
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            failureThreshold: 12
