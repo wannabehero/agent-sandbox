@@ -13,8 +13,10 @@
 # limitations under the License.
 
 
+import asyncio
 import httpx
-from fastapi import FastAPI, Request, HTTPException
+import websockets
+from fastapi import FastAPI, Request, HTTPException, WebSocket
 from fastapi.responses import StreamingResponse
 
 # Initialize the FastAPI application
@@ -30,6 +32,80 @@ client = httpx.AsyncClient(timeout=180.0)
 async def health_check():
     """A simple health check endpoint that always returns 200 OK."""
     return {"status": "ok"}
+
+
+@app.websocket("/{full_path:path}")
+async def websocket_proxy(websocket: WebSocket, full_path: str):
+    """Proxy WebSocket connections to the target sandbox pod."""
+    sandbox_id = websocket.headers.get("X-Sandbox-ID")
+    if not sandbox_id:
+        await websocket.close(code=1008)
+        return
+
+    namespace = websocket.headers.get("X-Sandbox-Namespace", DEFAULT_NAMESPACE)
+    if not namespace.replace("-", "").isalnum():
+        await websocket.close(code=1008)
+        return
+
+    try:
+        port = int(websocket.headers.get("X-Sandbox-Port", DEFAULT_SANDBOX_PORT))
+    except ValueError:
+        await websocket.close(code=1008)
+        return
+
+    await websocket.accept()
+
+    target_host = f"{sandbox_id}.{namespace}.svc.cluster.local"
+    query = websocket.url.query
+    target_url = f"ws://{target_host}:{port}/{full_path}"
+    if query:
+        target_url += "?" + query
+
+    print(f"Proxying WebSocket for sandbox '{sandbox_id}' to {target_url}")
+
+    try:
+        async with websockets.connect(target_url) as target_ws:
+            async def client_to_pod():
+                try:
+                    while True:
+                        raw = await websocket.receive()
+                        if raw.get("bytes"):
+                            await target_ws.send(raw["bytes"])
+                        elif raw.get("text"):
+                            await target_ws.send(raw["text"])
+                        elif raw.get("type") == "websocket.disconnect":
+                            break
+                except Exception:
+                    pass
+
+            async def pod_to_client():
+                try:
+                    async for msg in target_ws:
+                        if isinstance(msg, bytes):
+                            await websocket.send_bytes(msg)
+                        else:
+                            await websocket.send_text(msg)
+                except Exception:
+                    pass
+
+            tasks = [
+                asyncio.ensure_future(client_to_pod()),
+                asyncio.ensure_future(pod_to_client()),
+            ]
+            done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            for t in pending:
+                t.cancel()
+                try:
+                    await t
+                except asyncio.CancelledError:
+                    pass
+    except Exception as e:
+        print(f"WebSocket proxy error for '{sandbox_id}': {e}")
+    finally:
+        try:
+            await websocket.close()
+        except Exception:
+            pass
 
 
 @app.api_route("/{full_path:path}", methods=['GET', 'POST', 'PUT', 'DELETE', 'PATCH'])

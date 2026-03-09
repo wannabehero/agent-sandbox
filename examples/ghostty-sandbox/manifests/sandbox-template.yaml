@@ -1,0 +1,27 @@
+apiVersion: extensions.agents.x-k8s.io/v1alpha1
+kind: SandboxTemplate
+metadata:
+  name: ghostty-template
+  namespace: opencode
+spec:
+  podTemplate:
+    spec:
+      containers:
+        - name: sandbox
+          image: ghostty-sandbox:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 4096
+          env:
+            - name: ANTHROPIC_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: ghostty-keys
+                  key: anthropic
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 4096
+            initialDelaySeconds: 5
+            periodSeconds: 3
+            failureThreshold: 10
