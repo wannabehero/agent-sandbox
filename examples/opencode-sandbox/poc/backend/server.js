@@ -115,72 +115,102 @@ async function createOcSession(claimName) {
   return data.id
 }
 
-// ── SSE transform ─────────────────────────────────────────────────────────────
-// opencode SSE:  data: {"type":"message.part.updated","properties":{"delta":"hi",...}}
-// client expects: data: {"delta":"hi"}  and data: [DONE] at the end
-function transformOcSSE(rawChunk) {
-  const lines = rawChunk.toString()
-  const out   = []
-  for (const line of lines.split('\n')) {
-    if (!line.startsWith('data: ')) { out.push(line); continue }
-    const payload = line.slice(6)
-    if (payload === '[DONE]') { out.push(line); continue }
-    try {
-      const ev = JSON.parse(payload)
-      if (ev.type === 'message.part.updated' && ev.properties?.delta) {
-        out.push(`data: ${JSON.stringify({ delta: ev.properties.delta })}`)
-      }
-      // silently drop housekeeping events (session.updated, etc.)
-    } catch { out.push(line) }
-  }
-  return out.join('\n')
-}
-
-function proxyStream(claimName, ocSessionId, msgBody, clientRes) {
-  const body = {
-    parts:      [{ type: 'text', text: msgBody.text }],
+// ── SSE streaming ─────────────────────────────────────────────────────────────
+// opencode API (current):
+//   POST /session/:id/message  → returns JSON immediately (fire-and-forget)
+//   GET  /global/event         → SSE stream of all events; filter by sessionID
+//
+// Relevant event types:
+//   message.part.delta  { field: "text", delta: "..." }  → text token
+//   session.idle        { sessionID: "..." }              → response complete
+//
+// client expects: data: {"delta":"..."} tokens, then data: [DONE]
+function proxyStream(claimName, ocSessionId, msgText, clientRes) {
+  const msgBuf = Buffer.from(JSON.stringify({
+    parts:      [{ type: 'text', text: msgText }],
     providerID: OC_PROVIDER,
     modelID:    OC_MODEL.split('/').slice(1).join('/'),
-  }
-  const bodyBuf = Buffer.from(JSON.stringify(body))
+  }))
 
-  const opts = {
+  // 1. Open SSE connection to /global/event
+  const sseReq = http.request({
     hostname: ROUTER_HOST,
     port:     ROUTER_PORT,
-    path:     `/session/${ocSessionId}/message`,
-    method:   'POST',
+    path:     '/global/event',
+    method:   'GET',
     headers: {
-      'Content-Type':        'application/json',
-      'Content-Length':      bodyBuf.length,
       'X-Sandbox-ID':        claimName,
       'X-Sandbox-Namespace': NAMESPACE,
       'X-Sandbox-Port':      SANDBOX_PORT,
     },
-  }
-
-  const proxyReq = http.request(opts, proxyRes => {
+  }, sseRes => {
     clientRes.writeHead(200, {
       'Content-Type':  'text/event-stream',
       'Cache-Control': 'no-cache',
       'Connection':    'keep-alive',
     })
-    proxyRes.on('data', chunk => {
-      const transformed = transformOcSSE(chunk)
-      if (transformed.trim()) clientRes.write(transformed + '\n')
-    })
-    proxyRes.on('end', () => {
+
+    let buf = '', finished = false
+
+    function finish() {
+      if (finished) return
+      finished = true
       clientRes.write('data: [DONE]\n\n')
       clientRes.end()
+      sseReq.destroy()
+    }
+
+    sseRes.on('data', chunk => {
+      buf += chunk.toString()
+      const lines = buf.split('\n')
+      buf = lines.pop()
+      for (const line of lines) {
+        if (!line.startsWith('data: ')) continue
+        let ev
+        try { ev = JSON.parse(line.slice(6)) } catch { continue }
+        const p = ev.payload
+        if (!p) continue
+        const props = p.properties || {}
+        // filter to our session
+        const sid = props.sessionID || props.info?.sessionID
+        if (sid && sid !== ocSessionId) continue
+        if (p.type === 'message.part.delta' && props.field === 'text' && props.delta) {
+          clientRes.write(`data: ${JSON.stringify({ delta: props.delta })}\n\n`)
+        }
+        if (p.type === 'session.idle') finish()
+      }
     })
+
+    sseRes.on('end', finish)
+
+    // 2. POST message after SSE is connected
+    const msgReq = http.request({
+      hostname: ROUTER_HOST,
+      port:     ROUTER_PORT,
+      path:     `/session/${ocSessionId}/message`,
+      method:   'POST',
+      headers: {
+        'Content-Type':        'application/json',
+        'Content-Length':      msgBuf.length,
+        'X-Sandbox-ID':        claimName,
+        'X-Sandbox-Namespace': NAMESPACE,
+        'X-Sandbox-Port':      SANDBOX_PORT,
+      },
+    }, () => {})
+    msgReq.on('error', err => {
+      if (!clientRes.headersSent) clientRes.writeHead(502)
+      clientRes.end(`data: ${JSON.stringify({ error: err.message })}\n\ndata: [DONE]\n\n`)
+      sseReq.destroy()
+    })
+    msgReq.write(msgBuf)
+    msgReq.end()
   })
 
-  proxyReq.on('error', err => {
+  sseReq.on('error', err => {
     if (!clientRes.headersSent) clientRes.writeHead(502)
     clientRes.end(`data: ${JSON.stringify({ error: err.message })}\n\ndata: [DONE]\n\n`)
   })
-
-  proxyReq.write(bodyBuf)
-  proxyReq.end()
+  sseReq.end()
 }
 
 // ── HTTP server ───────────────────────────────────────────────────────────────
@@ -236,7 +266,7 @@ const server = http.createServer(async (req, res) => {
         res.writeHead(400); res.end('bad json'); return
       }
       console.log(`[message] → ${claim} (oc: ${sess.ocSessionId})`)
-      proxyStream(claim, sess.ocSessionId, body, res)
+      proxyStream(claim, sess.ocSessionId, body.text, res)
     })
     return
   }
