@@ -116,17 +116,29 @@ async function createOcSession(claimName) {
 }
 
 // ── SSE streaming ─────────────────────────────────────────────────────────────
-// opencode API (current):
-//   POST /session/:id/message  → returns JSON immediately (fire-and-forget)
+// opencode API:
+//   POST /session/:id/message  → fire-and-forget (returns JSON immediately)
 //   GET  /global/event         → SSE stream of all events; filter by sessionID
 //
 // Relevant event types:
-//   message.part.delta  { field: "text", delta: "..." }  → text token
-//   session.idle        { sessionID: "..." }              → response complete
+//   message.part.delta   { field:"text", delta:"..." }    → text token
+//   message.part.updated { part: { type:"tool-result" } } → tool output (plugin events)
+//   session.idle         { sessionID:"..." }              → response complete
 //
-// client expects: data: {"delta":"..."} tokens, then data: [DONE]
-// additionally:  data: {"type":"pr_url","url":"..."} when a GitHub PR URL is found
-const PR_URL_RE = /https:\/\/github\.com\/[^\s)>\]"]+\/pull\/\d+/g
+// Structured events from the oc-events plugin arrive as OC_EVENT markers
+// appended to tool-result output.  Marker format:
+//   OC_EVENT: {"type":"<event-type>", ...payload}
+// These are forwarded as-is to the browser over the client SSE stream.
+
+// Parse all OC_EVENT markers out of a tool-result output string.
+function parseOcEvents(text) {
+  const events = []
+  for (const line of text.split('\n')) {
+    if (!line.startsWith('OC_EVENT: ')) continue
+    try { events.push(JSON.parse(line.slice(10))) } catch {}
+  }
+  return events
+}
 
 function proxyStream(claimName, ocSessionId, msgText, clientRes) {
   const msgBuf = Buffer.from(JSON.stringify({
@@ -154,9 +166,6 @@ function proxyStream(claimName, ocSessionId, msgText, clientRes) {
     })
 
     let buf = '', finished = false
-    // Accumulated response text — used to detect PR URLs as they complete.
-    let textAccum = ''
-    const seenUrls = new Set()
 
     function finish() {
       if (finished) return
@@ -180,18 +189,23 @@ function proxyStream(claimName, ocSessionId, msgText, clientRes) {
         // filter to our session
         const sid = props.sessionID || props.info?.sessionID
         if (sid && sid !== ocSessionId) continue
+
+        // Text token → forward delta to browser
         if (p.type === 'message.part.delta' && props.field === 'text' && props.delta) {
-          const { delta } = props
-          clientRes.write(`data: ${JSON.stringify({ delta })}\n\n`)
-          textAccum += delta
-          // Emit pr_url events the first time each GitHub PR URL fully appears.
-          for (const url of (textAccum.match(PR_URL_RE) || [])) {
-            if (!seenUrls.has(url)) {
-              seenUrls.add(url)
-              clientRes.write(`data: ${JSON.stringify({ type: 'pr_url', url })}\n\n`)
+          clientRes.write(`data: ${JSON.stringify({ delta: props.delta })}\n\n`)
+        }
+
+        // Tool result → parse OC_EVENT markers injected by the oc-events plugin
+        if (p.type === 'message.part.updated') {
+          const part = props.part || props
+          if (part.type === 'tool-result' || part.type === 'tool_result') {
+            const output = part.output ?? part.content ?? ''
+            for (const ocEv of parseOcEvents(String(output))) {
+              clientRes.write(`data: ${JSON.stringify(ocEv)}\n\n`)
             }
           }
         }
+
         if (p.type === 'session.idle') finish()
       }
     })

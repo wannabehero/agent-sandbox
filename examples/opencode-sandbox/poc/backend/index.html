@@ -14,19 +14,33 @@
   <script>
     let sessionId = null
 
-    // Called when the backend detects a GitHub PR URL in the opencode stream.
-    // Renders a persistent clickable link above the input area.
-    function showPrLink(url) {
+    // Dispatch structured OC_EVENT events from the oc-events plugin.
+    // Add new event types here as the plugin grows.
+    function handleOcEvent(ev) {
       const links = document.getElementById('pr-links')
-      for (const a of links.querySelectorAll('a')) if (a.href === url) return
-      const a = document.createElement('a')
-      a.href = url
-      a.target = '_blank'
-      a.rel = 'noopener'
-      a.textContent = 'Open PR: ' + url
-      const div = document.createElement('div')
-      div.appendChild(a)
-      links.appendChild(div)
+      if (ev.type === 'pr_created' || ev.type === 'pr_url') {
+        if ([...links.querySelectorAll('a')].some(a => a.href === ev.url)) return
+        const a = document.createElement('a')
+        a.href = ev.url
+        a.target = '_blank'
+        a.rel = 'noopener'
+        a.textContent = 'Open PR: ' + ev.url
+        const div = document.createElement('div')
+        div.appendChild(a)
+        links.appendChild(div)
+      } else if (ev.type === 'pr_merged') {
+        const div = document.createElement('div')
+        div.textContent = 'PR merged: ' + ev.url
+        links.appendChild(div)
+      } else if (ev.type === 'tests_passed') {
+        const div = document.createElement('div')
+        div.textContent = '✓ tests passed'
+        links.appendChild(div)
+      } else if (ev.type === 'tests_failed') {
+        const div = document.createElement('div')
+        div.textContent = '✗ tests failed'
+        links.appendChild(div)
+      }
     }
 
     function setStatus(s) {
@@ -102,8 +116,8 @@
           if (data === '[DONE]') continue
           try {
               const ev = JSON.parse(data)
-              if (ev.delta)          asstEl.textContent += ev.delta
-              if (ev.type === 'pr_url') showPrLink(ev.url)
+              if (ev.delta)  asstEl.textContent += ev.delta
+              if (ev.type)   handleOcEvent(ev)
             } catch {}
         }
       }
