@@ -125,6 +125,9 @@ async function createOcSession(claimName) {
 //   session.idle        { sessionID: "..." }              → response complete
 //
 // client expects: data: {"delta":"..."} tokens, then data: [DONE]
+// additionally:  data: {"type":"pr_url","url":"..."} when a GitHub PR URL is found
+const PR_URL_RE = /https:\/\/github\.com\/[^\s)>\]"]+\/pull\/\d+/g
+
 function proxyStream(claimName, ocSessionId, msgText, clientRes) {
   const msgBuf = Buffer.from(JSON.stringify({
     parts:      [{ type: 'text', text: msgText }],
@@ -151,6 +154,9 @@ function proxyStream(claimName, ocSessionId, msgText, clientRes) {
     })
 
     let buf = '', finished = false
+    // Accumulated response text — used to detect PR URLs as they complete.
+    let textAccum = ''
+    const seenUrls = new Set()
 
     function finish() {
       if (finished) return
@@ -175,7 +181,16 @@ function proxyStream(claimName, ocSessionId, msgText, clientRes) {
         const sid = props.sessionID || props.info?.sessionID
         if (sid && sid !== ocSessionId) continue
         if (p.type === 'message.part.delta' && props.field === 'text' && props.delta) {
-          clientRes.write(`data: ${JSON.stringify({ delta: props.delta })}\n\n`)
+          const { delta } = props
+          clientRes.write(`data: ${JSON.stringify({ delta })}\n\n`)
+          textAccum += delta
+          // Emit pr_url events the first time each GitHub PR URL fully appears.
+          for (const url of (textAccum.match(PR_URL_RE) || [])) {
+            if (!seenUrls.has(url)) {
+              seenUrls.add(url)
+              clientRes.write(`data: ${JSON.stringify({ type: 'pr_url', url })}\n\n`)
+            }
+          }
         }
         if (p.type === 'session.idle') finish()
       }
