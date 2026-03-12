@@ -896,6 +896,136 @@ tool execution works inside the sandbox.
 
 ---
 
+## Per-session workspace initialisation
+
+This section captures design decisions around injecting per-session context
+(repository, branch, credentials) into a sandbox pod before the first opencode
+message is sent.
+
+### Why SandboxClaim cannot carry parameters today
+
+`SandboxClaimSpec` currently has two fields: `sandboxTemplateRef` and
+`lifecycle`. There is no mechanism to pass per-session values such as a git
+repository URL, a branch name, or a user token.
+
+More importantly, even if the API were extended with a `parameters` map, it
+would only affect **cold-start** pods. Warm pool pods are already running when
+a claim adopts them; their environment is frozen at container start and cannot
+be changed without a restart.
+
+### Preferred approach: `kubectl exec` after adoption, before session creation
+
+After the SandboxClaim reaches `Ready` the adopted pod is running and
+opencode is already serving on port 4096. At this point the backend can
+`kubectl exec` arbitrary commands into the container to set up the workspace
+before creating the opencode session.
+
+The sequence in `backend/server.js`:
+
+```
+POST /session
+  1. applyYaml(claimYaml(claim))
+  2. waitReady(claim)           ← warm adoption < 1 s
+  3. getPodName(claim)          ← reads agents.x-k8s.io/pod-name annotation
+  4. kubectl exec … git clone   ← workspace init
+  5. createOcSession(claim)     ← opencode session created on clean workspace
+  6. return { id: claim }
+```
+
+The pod name is available from the `agents.x-k8s.io/pod-name` annotation on
+the Sandbox object (written by the claim controller at adoption time,
+`extensions/controllers/sandboxclaim_controller.go`). For cold-start pods the
+annotation is absent; fall back to using the sandbox name directly as the pod
+name.
+
+```js
+function getPodName(claimName) {
+  return kubectl(
+    'get', 'sandbox', claimName, '-n', NAMESPACE,
+    `-o=jsonpath={.metadata.annotations.agents\\.x-k8s\\.io/pod-name}`
+  ).trim() || claimName   // cold-start fallback
+}
+```
+
+### Cloning a repository
+
+```js
+if (body.gitRepo) {
+  const podName = getPodName(claim)
+  execInPod(podName, 'git', 'clone', body.gitRepo, '/workspace/repo')
+  if (body.gitBranch) {
+    execInPod(podName, 'git', '-C', '/workspace/repo', 'checkout', body.gitBranch)
+  }
+}
+```
+
+**Sandbox image requirement**: `node:22-slim` does not ship `git`. Add it:
+
+```dockerfile
+RUN apt-get update && apt-get install -y git && rm -rf /var/lib/apt/lists/*
+```
+
+### Injecting a per-user GitHub token
+
+Each user brings their own `ghToken` (resolved server-side from the user's
+authenticated session — never taken directly from the browser request).
+
+```js
+function injectGhToken(podName, token) {
+  // Pipe via stdin to avoid shell interpolation of the token value.
+  const r = spawnSync('kubectl', [
+    'exec', podName, '-n', NAMESPACE, '--',
+    'bash', '-c', 'gh auth login --with-token',
+  ], { input: token, encoding: 'utf8' })
+  if (r.status !== 0) throw new Error(r.stderr)
+}
+```
+
+Git https clones also need credentials:
+
+```js
+execInPod(podName, 'git', 'config', '--global', 'credential.helper', 'store')
+// Write credentials file — token passed via spawnSync input, not shell interpolation
+spawnSync('kubectl', [
+  'exec', podName, '-n', NAMESPACE, '--',
+  'bash', '-c', 'cat >> ~/.git-credentials',
+], { input: `https://x-access-token:${token}@github.com\n`, encoding: 'utf8' })
+```
+
+**Security properties of this approach**
+
+| Property | Detail |
+|----------|--------|
+| Token scope | Lives only in the adopted pod; deleted with the pod when the claim is removed |
+| No warm pool contamination | Warm pods never hold any user token; injection happens post-adoption |
+| No CRD changes required | Plain `kubectl exec`; no new API surface |
+| Shell injection prevention | Pass the token via `spawnSync`'s `input` (stdin), never interpolated into a shell string |
+| Backend ownership | Token travels backend → pod only; the browser never sends a raw token to the backend |
+
+**Sandbox image requirement**: `gh` CLI must be installed. Add to the Dockerfile:
+
+```dockerfile
+RUN apt-get update && apt-get install -y git curl && \
+    curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+      -o /usr/share/keyrings/githubcli-archive-keyring.gpg && \
+    echo "deb [signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] \
+      https://cli.github.com/packages stable main" \
+      > /etc/apt/sources.list.d/github-cli.list && \
+    apt-get update && apt-get install -y gh && \
+    rm -rf /var/lib/apt/lists/*
+```
+
+### Alternatives considered and rejected
+
+| Alternative | Why rejected |
+|-------------|--------------|
+| `env` field in `SandboxClaimSpec` | Only works for cold-start pods; warm pods ignore it without a restart |
+| Per-claim ConfigMap mounted as `envFrom` | Same limitation: env vars are read at container start, not after adoption |
+| Baking repo/branch into `SandboxTemplate` | Requires one template per repo; defeats the purpose of a shared warm pool |
+| Sending token as first opencode message | Token appears in conversation history; harder to audit and revoke |
+
+---
+
 ## Latency budget
 
 | Scenario | Latency | Breakdown |
